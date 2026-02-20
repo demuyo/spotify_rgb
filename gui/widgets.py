@@ -587,3 +587,29 @@ class Separator(QFrame):
         self.setFrameShape(QFrame.Shape.HLine)
         self.setFrameShadow(QFrame.Shadow.Sunken)
         self.setStyleSheet("background-color: #333; max-height: 1px; margin: 8px 0;")
+
+class LabeledToggle(QWidget):
+    """Toggle switch com label."""
+    
+    toggled = pyqtSignal(bool)
+    
+    def __init__(self, label: str, initial: bool = False, parent=None):
+        super().__init__(parent)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        
+        self._label = QLabel(label)
+        layout.addWidget(self._label)
+        
+        layout.addStretch()
+        
+        self._checkbox = QCheckBox()
+        self._checkbox.setChecked(initial)
+        self._checkbox.toggled.connect(self.toggled.emit)
+        layout.addWidget(self._checkbox)
+    
+    def isChecked(self) -> bool:
+        return self._checkbox.isChecked()
+    
+    def setChecked(self, checked: bool):
+        self._checkbox.setChecked(checked)

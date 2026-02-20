@@ -7,7 +7,39 @@ Permite alterar config em runtime sem reiniciar o programa.
 import threading
 import time
 import copy
+import types
 from typing import Any, Callable, Dict, List, Optional
+
+
+def _safe_deepcopy(val):
+    """
+    Copia um valor de forma segura.
+    Se não conseguir, retorna o valor original.
+    """
+    # Tipos que não podem/não precisam ser copiados
+    if val is None:
+        return None
+    if isinstance(val, (str, int, float, bool)):
+        return val
+    if isinstance(val, types.ModuleType):
+        return None  # Ignora módulos
+    if callable(val) and not isinstance(val, (list, tuple, dict, type)):
+        return None  # Ignora funções
+    
+    try:
+        return copy.deepcopy(val)
+    except (TypeError, AttributeError):
+        # Se não conseguir copiar, tenta cópia rasa
+        try:
+            if isinstance(val, dict):
+                return dict(val)
+            if isinstance(val, list):
+                return list(val)
+            if isinstance(val, tuple):
+                return tuple(val)
+            return val
+        except:
+            return val
 
 
 class ConfigManager:
@@ -39,6 +71,7 @@ class ConfigManager:
         self._rw_lock = threading.RLock()
         self._dirty = False
         self._categories: Dict[str, List[str]] = {}
+        self._key_to_category: Dict[str, str] = {}
 
         self._load_from_config_module()
 
@@ -46,10 +79,15 @@ class ConfigManager:
         """Carrega todos os valores do config.py atual."""
         import config
 
+        # Nomes a ignorar (módulos, funções internas, credenciais)
         skip = {
-            "os", "Path", "ENV_PATH", "load_env",
-            "SPOTIFY_CLIENT_ID", "SPOTIFY_CLIENT_SECRET",
-            "SPOTIFY_REDIRECT_URI",
+            # Módulos comuns
+            "os", "sys", "Path", "pathlib", "logging", "json", "time",
+            "threading", "copy", "types", "typing",
+            # Funções/variáveis internas
+            "ENV_PATH", "load_env", "APP_DIR",
+            # Credenciais (ficam no .env)
+            "SPOTIFY_CLIENT_ID", "SPOTIFY_CLIENT_SECRET", "SPOTIFY_REDIRECT_URI",
         }
 
         categories = {
@@ -76,12 +114,22 @@ class ConfigManager:
             "color_shift": [
                 "COLOR_SHIFT_KICK", "COLOR_SHIFT_SNARE", "COLOR_SHIFT_PEAK",
             ],
+            "color_strategy": [
+                "COLOR_SELECTION_STRATEGY", "COLOR_ASSIGNMENT_MODE", "COLOR_MIN_SATURATION",
+            ],
             "sensitivity": [
                 "SENSITIVITY", "PEAKS_SENSITIVITY",
                 "CUSTOM_KICK_THRESHOLD", "CUSTOM_SNARE_THRESHOLD",
                 "CUSTOM_KICK_MIN_ENERGY", "CUSTOM_SNARE_MIN_ENERGY",
                 "CUSTOM_KICK_MINIOI", "CUSTOM_SNARE_MINIOI",
                 "PEAK_HOLD_TIME", "PEAK_MIN_INTERVAL", "HIT_HOLD_TIME",
+            ],
+            "dynamics": [
+                "AGC_ENABLED", "AGC_MAX_GAIN", "AGC_MIN_GAIN", "AGC_TARGET",
+                "AGC_ATTACK", "AGC_RELEASE",
+                "COMPRESSOR_THRESHOLD", "COMPRESSOR_RATIO", "COMPRESSOR_KNEE", "COMPRESSOR_MAKEUP",
+                "ADAPTIVE_SMOOTHING", "SMOOTHING_LOW_VOL_MULT", "SMOOTHING_LOW_VOL_THRESH",
+                "DYNAMIC_FLOOR_ENABLED", "DYNAMIC_FLOOR_MAX", "DYNAMIC_FLOOR_THRESH",
             ],
             "bands": [
                 "BAND_ZONE_PERCUSSION", "BAND_ZONE_BASS", "BAND_ZONE_MELODY",
@@ -90,7 +138,7 @@ class ConfigManager:
                 "BAND_SAT_PERCUSSION", "BAND_SAT_BASS", "BAND_SAT_MELODY",
                 "BAND_SMOOTHING_ATTACK", "BAND_SMOOTHING_DECAY",
                 "BAND_BEAT_ATTACK", "BAND_BEAT_DECAY",
-                "BAND_BEAT_FLASH", "BAND_BEAT_COLOR_SHIFT",
+                "BAND_BEAT_FLASH", "BAND_BEAT_COLOR_SHIFT", "BAND_COLOR_SHIFT_MODE",
                 "BAND_BG_BRIGHTNESS", "BAND_INTERNAL_GRADIENT",
                 "BAND_COLOR_LERP", "BAND_ZONE_BLEND_WIDTH",
                 "BAND_BOOST_PERCUSSION", "BAND_BOOST_BASS", "BAND_BOOST_MELODY",
@@ -101,6 +149,9 @@ class ConfigManager:
                 "BAND_RESPONSE_CURVE",
                 "BAND_COMPRESSION_ENABLED", "BAND_COMPRESSION_THRESHOLD",
                 "BAND_COMPRESSION_RATIO",
+                "BAND_FREQ_BASS_MIN", "BAND_FREQ_BASS_MAX",
+                "BAND_FREQ_MELODY_MIN", "BAND_FREQ_MELODY_MAX",
+                "BAND_FREQ_PERCUSSION_MIN", "BAND_FREQ_PERCUSSION_MAX",
             ],
             "chase": [
                 "CHASE_ENABLED", "CHASE_SPEED_MAX", "CHASE_TAIL_LENGTH",
@@ -128,25 +179,52 @@ class ConfigManager:
 
         with self._rw_lock:
             for attr_name in dir(config):
-                if attr_name.startswith("_") or attr_name in skip:
+                # Pula atributos internos
+                if attr_name.startswith("_"):
                     continue
-                val = getattr(config, attr_name)
-                if callable(val) and not isinstance(val, (list, tuple, dict)):
+                
+                # Pula nomes conhecidos a ignorar
+                if attr_name in skip:
                     continue
-                self._values[attr_name] = copy.deepcopy(val)
-                self._defaults[attr_name] = copy.deepcopy(val)
+                
+                # Pega o valor
+                try:
+                    val = getattr(config, attr_name)
+                except Exception:
+                    continue
+                
+                # Pula módulos
+                if isinstance(val, types.ModuleType):
+                    continue
+                
+                # Pula funções (exceto se for lista/tuple/dict)
+                if callable(val) and not isinstance(val, (list, tuple, dict, type)):
+                    continue
+                
+                # Pula classes
+                if isinstance(val, type):
+                    continue
+                
+                # Copia de forma segura
+                copied = _safe_deepcopy(val)
+                if copied is None and val is not None:
+                    # Se não conseguiu copiar e não era None, pula
+                    continue
+                
+                self._values[attr_name] = copied
+                self._defaults[attr_name] = _safe_deepcopy(val)
 
             self._categories = categories
 
             # Mapear cada key à sua categoria
-            self._key_to_category: Dict[str, str] = {}
             for cat, keys in categories.items():
                 for k in keys:
                     self._key_to_category[k] = cat
 
     def get(self, key: str, default=None) -> Any:
         with self._rw_lock:
-            return copy.deepcopy(self._values.get(key, default))
+            val = self._values.get(key, default)
+            return _safe_deepcopy(val) if val is not None else default
 
     def set(self, key: str, value: Any, notify: bool = True):
         with self._rw_lock:
@@ -170,29 +248,28 @@ class ConfigManager:
                 self._dirty = True
 
         if notify and changed:
-            cats = set()
-            for k in changed:
-                cats.add(self._key_to_category.get(k, "unknown"))
             for k, v in changed.items():
                 cat = self._key_to_category.get(k, "unknown")
                 self._notify(k, v, cat)
 
     def reset(self, key: str):
         if key in self._defaults:
-            self.set(key, copy.deepcopy(self._defaults[key]))
+            self.set(key, _safe_deepcopy(self._defaults[key]))
 
     def reset_category(self, category: str):
         keys = self._categories.get(category, [])
         updates = {}
         for k in keys:
             if k in self._defaults:
-                updates[k] = copy.deepcopy(self._defaults[k])
+                updates[k] = _safe_deepcopy(self._defaults[k])
         if updates:
             self.set_many(updates)
 
     def reset_all(self):
         with self._rw_lock:
-            self._values = copy.deepcopy(self._defaults)
+            self._values = {}
+            for k, v in self._defaults.items():
+                self._values[k] = _safe_deepcopy(v)
             self._dirty = True
         self._notify_all()
 
@@ -241,18 +318,27 @@ class ConfigManager:
         with self._rw_lock:
             for key, value in self._values.items():
                 if hasattr(config, key):
-                    setattr(config, key, copy.deepcopy(value))
+                    try:
+                        setattr(config, key, _safe_deepcopy(value))
+                    except Exception:
+                        pass
             self._dirty = False
 
     def save_to_file(self, filepath: str = None):
         """Salva as configurações atuais no arquivo config.py."""
+        import sys
+        from pathlib import Path
+        
         if filepath is None:
-            from pathlib import Path
-            filepath = str(Path(__file__).parent / "config.py")
+            if getattr(sys, 'frozen', False):
+                filepath = str(Path(sys.executable).parent / "config.py")
+            else:
+                filepath = str(Path(__file__).parent / "config.py")
 
         with self._rw_lock:
-            values = copy.deepcopy(self._values)
-            defaults = copy.deepcopy(self._defaults)
+            values = {}
+            for k, v in self._values.items():
+                values[k] = _safe_deepcopy(v)
 
         lines = []
         lines.append('# config.py')
@@ -262,13 +348,20 @@ class ConfigManager:
         lines.append('"""')
         lines.append('')
         lines.append('import os')
+        lines.append('import sys')
         lines.append('from pathlib import Path')
         lines.append('')
-        lines.append('ENV_PATH = Path(__file__).parent / ".env"')
+        lines.append('# Detecta diretório do executável')
+        lines.append("if getattr(sys, 'frozen', False):")
+        lines.append('    APP_DIR = Path(sys.executable).parent')
+        lines.append('else:')
+        lines.append('    APP_DIR = Path(__file__).parent')
+        lines.append('')
+        lines.append('ENV_PATH = APP_DIR / ".env"')
         lines.append('')
         lines.append('def load_env():')
         lines.append('    if ENV_PATH.exists():')
-        lines.append('        with open(ENV_PATH) as f:')
+        lines.append("        with open(ENV_PATH, encoding='utf-8') as f:")
         lines.append('            for line in f:')
         lines.append('                line = line.strip()')
         lines.append('                if line and not line.startswith("#") and "=" in line:')
@@ -283,9 +376,9 @@ class ConfigManager:
         lines.append('# SPOTIFY API')
         lines.append('# ' + '═' * 78)
         lines.append('')
-        lines.append('SPOTIFY_CLIENT_ID     = os.environ["SPOTIPY_CLIENT_ID"]')
-        lines.append('SPOTIFY_CLIENT_SECRET = os.environ["SPOTIPY_CLIENT_SECRET"]')
-        lines.append('SPOTIFY_REDIRECT_URI  = os.environ["SPOTIPY_REDIRECT_URI"]')
+        lines.append('SPOTIFY_CLIENT_ID     = os.environ.get("SPOTIPY_CLIENT_ID", "")')
+        lines.append('SPOTIFY_CLIENT_SECRET = os.environ.get("SPOTIPY_CLIENT_SECRET", "")')
+        lines.append('SPOTIFY_REDIRECT_URI  = os.environ.get("SPOTIPY_REDIRECT_URI", "http://localhost:8888/callback")')
 
         # Gerar seções
         section_order = [
@@ -293,18 +386,15 @@ class ConfigManager:
             ("OPENRGB", "openrgb"),
             ("LED CONFIGURATION", "leds"),
             ("COR PADRÃO", "general"),
-            ("AUDIO REACTIVE", "general"),
-            ("VISUAL EFFECT", "general"),
-            ("DETECÇÃO", "general"),
             ("BRILHO", "brightness"),
+            ("COLOR STRATEGY", "color_strategy"),
             ("COLOR SHIFT", "color_shift"),
             ("SENSIBILIDADE", "sensitivity"),
+            ("AGC E DINÂMICA", "dynamics"),
             ("CHASE EFFECT", "chase"),
             ("FREQUENCY EFFECT", "frequency"),
             ("HYBRID EFFECT", "hybrid"),
             ("BAND EFFECT", "bands"),
-            ("BOOST E DINÂMICA", "bands"),
-            ("MAPEAMENTO DE BRILHO", "brightness"),
             ("STANDBY MODE", "standby"),
             ("QUANTIZED", "quantized"),
         ]
@@ -336,7 +426,7 @@ class ConfigManager:
             lines.append('# OUTROS')
             lines.append('# ' + '═' * 78)
             lines.append('')
-            for k in remaining:
+            for k in sorted(remaining):
                 lines.append(f'{k} = {repr(values[k])}')
 
         lines.append('')
@@ -347,10 +437,14 @@ class ConfigManager:
     def export_preset(self, name: str, filepath: str = None):
         """Exporta configuração atual como preset JSON."""
         import json
+        import sys
         from pathlib import Path
 
         if filepath is None:
-            presets_dir = Path(__file__).parent / "presets"
+            if getattr(sys, 'frozen', False):
+                presets_dir = Path(sys.executable).parent / "presets"
+            else:
+                presets_dir = Path(__file__).parent / "presets"
             presets_dir.mkdir(exist_ok=True)
             filepath = str(presets_dir / f"{name}.json")
 
@@ -358,10 +452,12 @@ class ConfigManager:
             data = {
                 "name": name,
                 "timestamp": time.time(),
-                "values": copy.deepcopy(self._values),
+                "values": {},
             }
+            for k, v in self._values.items():
+                data["values"][k] = _safe_deepcopy(v)
 
-        with open(filepath, 'w') as f:
+        with open(filepath, 'w', encoding='utf-8') as f:
             json.dump(data, f, indent=2, default=str)
 
         return filepath
@@ -370,7 +466,7 @@ class ConfigManager:
         """Importa preset JSON."""
         import json
 
-        with open(filepath, 'r') as f:
+        with open(filepath, 'r', encoding='utf-8') as f:
             data = json.load(f)
 
         values = data.get("values", {})

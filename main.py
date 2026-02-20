@@ -1,552 +1,488 @@
 # main.py
 """
-Spotify ↔ OpenRGB - Versão Otimizada
-- Auto-start silencioso
-- GUI lazy-load
-- Mínimo consumo de recursos
+Spotify RGB Sync — Versão Otimizada
+- Lazy imports
+- FPS limitado configurável  
+- Menos uso de memória
 """
 
-import logging
-import signal
 import sys
 import os
 import time
+import signal
+import logging
 import threading
+from pathlib import Path
 from typing import Optional, Tuple, List, Dict
 
-os.chdir(os.path.dirname(os.path.abspath(__file__)))
+# Diretório do app
+if getattr(sys, 'frozen', False):
+    APP_DIR = Path(sys.executable).parent
+else:
+    APP_DIR = Path(__file__).parent
+os.chdir(APP_DIR)
 
 # ══════════════════════════════════════════════════════════
-# LOGGING OTIMIZADO (menos verbose em produção)
+# LOGGING (mínimo em produção)
 # ══════════════════════════════════════════════════════════
 
-_debug_mode = "--debug" in sys.argv
-log_level = logging.DEBUG if _debug_mode else logging.WARNING  # WARNING em produção!
+_debug = "--debug" in sys.argv
 
 logging.basicConfig(
-    level=log_level,
+    level=logging.DEBUG if _debug else logging.WARNING,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[
-        logging.FileHandler("spotify_rgb.log", encoding="utf-8"),
-    ] if not _debug_mode else [
-        logging.StreamHandler(),
-        logging.FileHandler("spotify_rgb.log", encoding="utf-8"),
+        logging.StreamHandler() if _debug else logging.NullHandler(),
+        logging.FileHandler(APP_DIR / "spotify_rgb.log", encoding="utf-8"),
     ],
 )
 logger = logging.getLogger("SpotifyRGB")
 
 # ══════════════════════════════════════════════════════════
-# IMPORTS (só o necessário)
+# IMPORTS ESSENCIAIS (lazy imports pra GUI depois)
 # ══════════════════════════════════════════════════════════
 
 import config
-from spotify_module import create_spotify_client, get_current_track
-from color_module import get_dominant_color, adjust_brightness, clear_cache
-from openrgb_module import OpenRGBController
-from audio_spotify_only import AudioReactiveSpotifyOnly as AudioReactive
 
 # ══════════════════════════════════════════════════════════
-# GLOBAL STATE (mínimo)
+# ESTADO GLOBAL (usando __slots__ pra economia de memória)
 # ══════════════════════════════════════════════════════════
 
-_running = True
-_standby_mode = False
-_current_album_url: Optional[str] = None
-_current_track_id: Optional[str] = None
-_current_color: Tuple[int, int, int] = config.DEFAULT_COLOR
-_last_music_color: Tuple[int, int, int] = config.DEFAULT_COLOR
-_current_track_name: str = ""
-_is_playing: bool = False
+class AppState:
+    __slots__ = (
+        'running', 'standby', 'track_id', 'track_name', 'album_url',
+        'color', 'last_color', 'is_playing'
+    )
+    
+    def __init__(self):
+        self.running = True
+        self.standby = False
+        self.track_id = None
+        self.track_name = ""
+        self.album_url = None
+        self.color = config.DEFAULT_COLOR
+        self.last_color = config.DEFAULT_COLOR
+        self.is_playing = False
+
+state = AppState()
 
 RGB = Tuple[int, int, int]
 
 
 def signal_handler(sig, frame):
-    global _running
-    _running = False
-
+    state.running = False
 
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
 
 # ══════════════════════════════════════════════════════════
-# HELPERS OTIMIZADOS
+# HELPERS
 # ══════════════════════════════════════════════════════════
 
-def _smart_sleep(seconds: float):
-    """Sleep interruptível."""
+def smart_sleep(seconds: float):
     end = time.monotonic() + seconds
-    while _running and time.monotonic() < end:
-        time.sleep(min(0.5, end - time.monotonic()))
+    while state.running and time.monotonic() < end:
+        time.sleep(min(0.3, end - time.monotonic()))
 
-
-def _calc_poll(prog, dur, last_change):
-    """Calcula intervalo de polling dinâmico."""
-    if dur <= 0:
-        return config.POLL_INTERVAL
-    rem = (dur - prog) / 1000.0
-    since = time.monotonic() - last_change
-    if rem <= 5:
-        return config.POLL_ENDING_SOON
-    if rem <= 15:
-        return config.POLL_ENDING
-    if since < 30:
-        return config.POLL_AFTER_CHANGE
-    return config.POLL_INTERVAL
-
-
-# ══════════════════════════════════════════════════════════
-# LED HELPERS
-# ══════════════════════════════════════════════════════════
-
-def get_led_config(rgb: OpenRGBController) -> Tuple[int, List[Dict]]:
-    """Retorna (total_leds_usáveis, devices_info)."""
-    devices = rgb.get_active_devices()
-    real_total = sum(d["leds"] for d in devices)
-    
-    skip_start = getattr(config, 'LED_SKIP_START', 0)
-    skip_end = getattr(config, 'LED_SKIP_END', 0)
-    usable_total = real_total - skip_start - skip_end
-    
-    configured = getattr(config, 'LED_COUNT', None)
-    
-    if configured is None or configured <= 0:
-        return usable_total, devices
-    
-    return configured, devices
-
-
-def map_virtual_to_real(
-    virtual_colors: List[RGB],
-    virtual_count: int,
-    devices: List[Dict]
-) -> List[List[RGB]]:
-    """
-    Mapeia cores virtuais para LEDs reais.
-    
-    CORRIGIDO: Usa global_offset de cada device pra calcular corretamente.
-    """
-    # Calcula total REAL de LEDs
-    real_total = sum(d["leds"] for d in devices)
-    
-    skip_start = getattr(config, 'LED_SKIP_START', 0)
-    skip_end = getattr(config, 'LED_SKIP_END', 0)
-    
-    # Cria array completo (começa tudo preto)
-    full_colors = [(0, 0, 0)] * real_total
-    
-    # Região usável
-    usable_start = skip_start
-    usable_end = real_total - skip_end
-    usable_count = usable_end - usable_start
-    
-    if usable_count <= 0:
-        logger.warning(f"Nenhum LED usável! total={real_total}, skip_start={skip_start}, skip_end={skip_end}")
-        return [[c for c in [(0, 0, 0)] * d["leds"]] for d in devices]
-    
-    # Mapeia cores virtuais pra região usável
-    for i in range(usable_count):
-        # Posição no array de cores virtuais
-        if virtual_count > 1:
-            virtual_pos = (i / (usable_count - 1)) * (virtual_count - 1)
-        else:
-            virtual_pos = 0
-        
-        # Interpolação
-        idx_low = int(virtual_pos)
-        idx_high = min(idx_low + 1, virtual_count - 1)
-        frac = virtual_pos - idx_low
-        
-        c1 = virtual_colors[idx_low]
-        c2 = virtual_colors[idx_high]
-        
-        r = int(c1[0] + (c2[0] - c1[0]) * frac)
-        g = int(c1[1] + (c2[1] - c1[1]) * frac)
-        b = int(c1[2] + (c2[2] - c1[2]) * frac)
-        
-        # Posição REAL (global)
-        real_idx = usable_start + i
-        if 0 <= real_idx < real_total:
-            full_colors[real_idx] = (r, g, b)
-    
-    # ══════════════════════════════════════════════
-    # DISTRIBUI PROS DEVICES
-    # ══════════════════════════════════════════════
-    result = []
-    
-    # Usa global_offset se disponível, senão calcula
-    offset = 0
-    for dev in devices:
-        dev_offset = dev.get('global_offset', offset)
-        dev_leds = dev["leds"]
-        
-        # Pega as cores pra este device
-        dev_colors = full_colors[dev_offset:dev_offset + dev_leds]
-        
-        # Garante que tem a quantidade certa
-        if len(dev_colors) < dev_leds:
-            dev_colors = list(dev_colors) + [(0, 0, 0)] * (dev_leds - len(dev_colors))
-        
-        result.append(dev_colors)
-        offset += dev_leds
-    
-    return result
-
-
-# ══════════════════════════════════════════════════════════
-# SPOTIFY THREAD (OTIMIZADA)
-# ══════════════════════════════════════════════════════════
-
-def _spotify_thread(sp, rgb, rgb_ok):
-    """Thread que monitora o Spotify."""
-    global _running, _current_track_id, _current_color, _last_music_color
-    global _current_album_url, _standby_mode, _current_track_name, _is_playing
-
-    last_change = time.monotonic()
-    last_prog = -1
-    last_poll = time.monotonic()
-
-    while _running:
-        try:
-            now = time.monotonic()
-            elapsed = now - last_poll
-            last_poll = now
-
-            track = get_current_track(sp)
-
-            if track is None or not track.is_playing:
-                if _current_track_id is not None:
-                    _current_track_id = None
-                    last_prog = -1
-                
-                _standby_mode = True
-                _is_playing = False
-                
-                # Sleep longo quando idle (economia de recursos)
-                _smart_sleep(config.POLL_IDLE)
-                continue
-
-            _standby_mode = False
-            _is_playing = True
-
-            changed = track.track_id != _current_track_id
-
-            if changed:
-                _current_track_id = track.track_id
-                last_change = now
-                last_prog = track.progress_ms
-
-                clear_cache()
-                new_color = get_dominant_color(track.album_art)
-                _current_album_url = track.album_art
-
-                base = adjust_brightness(new_color, config.BRIGHTNESS_BASE)
-                if rgb_ok:
-                    rgb.set_all_leds(*base, log=False)
-
-                _current_color = new_color
-                _last_music_color = new_color
-                _current_track_name = f"{track.artist} - {track.name}"
-                
-                if _debug_mode:
-                    logger.info(f"🎵 {_current_track_name}")
-
-            else:
-                last_prog = track.progress_ms
-
-            _smart_sleep(_calc_poll(track.progress_ms, track.duration_ms, last_change))
-
-        except Exception as e:
-            if _debug_mode:
-                logger.error(f"Spotify: {e}")
-            _smart_sleep(config.POLL_INTERVAL * 2)
-
-
-# ══════════════════════════════════════════════════════════
-# EFEITOS (imports lazy)
-# ══════════════════════════════════════════════════════════
-
-_effect_cache = {}
-
-def _get_effect(effect_type: str, rgb: OpenRGBController):
-    """Lazy load de efeitos."""
-    global _effect_cache
-    
-    if effect_type in _effect_cache:
-        return _effect_cache[effect_type]
-    
-    if effect_type == "bands":
-        from band_module import BandVisualizer
-        
-        class BandEffect:
-            def __init__(self, rgb):
-                self.rgb = rgb
-                self.total_leds, self.devices = get_led_config(rgb)
-                self.viz = BandVisualizer(self.total_leds)
-                self._last_color = None
-                self._last_url = None
-                self._band_colors = {}
-            
-            def update(self, base_color, audio, album_url=None):
-                if base_color != self._last_color or album_url != self._last_url:
-                    colors = self.viz.set_base_color(base_color, album_url)
-                    self._last_color = base_color
-                    self._last_url = album_url
-                    if colors and len(colors) >= 3:
-                        self._band_colors = {
-                            'percussion': colors[0],
-                            'bass': colors[1],
-                            'melody': colors[2],
-                        }
-                
-                virtual_colors = self.viz.generate(
-                    bass=audio.bass,
-                    melody=audio.melody,
-                    percussion=audio.percussion,
-                    beat_intensity=audio.beat_intensity,
-                    volume=audio.volume_normalized,
-                    state=audio.state,
-                )
-                
-                real_colors = map_virtual_to_real(virtual_colors, self.total_leds, self.devices)
-                for dev, colors in zip(self.devices, real_colors):
-                    self.rgb.set_device_leds(dev["index"], colors)
-        
-        effect = BandEffect(rgb)
-        _effect_cache[effect_type] = effect
-        return effect
-    
-    # Fallback: efeito simples
-    return None
-
-
-# ══════════════════════════════════════════════════════════
-# STANDBY BREATHING (OTIMIZADO)
-# ══════════════════════════════════════════════════════════
-
-class StandbyBreathing:
-    """Breathing suave quando pausado."""
-    
-    def __init__(self, rgb: OpenRGBController):
-        self.rgb = rgb
-        self.total_leds, self.devices = get_led_config(rgb)
-        self.phase = 0.0
-        self._last_colors = None
-    
-    def update(self, base_color: RGB):
-        import math
-        
-        speed = getattr(config, 'STANDBY_BREATHING_SPEED', 0.025)
-        min_b = getattr(config, 'STANDBY_BRIGHTNESS_MIN', 0.15)
-        max_b = getattr(config, 'STANDBY_BRIGHTNESS_MAX', 0.40)
-        
-        self.phase += speed
-        if self.phase > math.pi * 2:
-            self.phase -= math.pi * 2
-        
-        wave = (math.sin(self.phase) + 1) / 2
-        brightness = min_b + (wave * (max_b - min_b))
-        
-        r = min(255, int(base_color[0] * brightness))
-        g = min(255, int(base_color[1] * brightness))
-        b = min(255, int(base_color[2] * brightness))
-        
-        color = (r, g, b)
-        
-        # Só atualiza se mudou (economia)
-        if color == self._last_colors:
-            return
-        self._last_colors = color
-        
-        virtual_colors = [color] * self.total_leds
-        real_colors = map_virtual_to_real(virtual_colors, self.total_leds, self.devices)
-        
-        for dev, colors in zip(self.devices, real_colors):
-            self.rgb.set_device_leds(dev["index"], colors)
-
-
-# ══════════════════════════════════════════════════════════
-# REACTIVE LOOP (OTIMIZADO)
-# ══════════════════════════════════════════════════════════
-
-def _reactive_loop(audio: AudioReactive, rgb: OpenRGBController):
-    """Loop principal otimizado."""
-    global _running, _current_album_url, _standby_mode
-
-    effect_type = getattr(config, 'VISUAL_EFFECT', 'bands')
-    effect = _get_effect(effect_type, rgb)
-    standby_effect = StandbyBreathing(rgb)
-    
-    rgb.set_mode("direct")
-    
-    # Timers pra reduzir updates
-    last_update = 0
-    min_interval = 0.012  # ~83 FPS máximo (na prática menos)
-    
-    # Intervalo maior quando standby
-    standby_interval = 0.030  # ~33 FPS no standby (suficiente pra breathing)
-
-    while _running:
-        now = time.monotonic()
-        
-        # ── STANDBY MODE ──
-        if _standby_mode:
-            if now - last_update < standby_interval:
-                time.sleep(0.005)
-                continue
-            
-            standby_effect.update(_last_music_color)
-            last_update = now
-            time.sleep(standby_interval)
-            continue
-        
-        # ── ACTIVE MODE ──
-        if now - last_update < min_interval:
-            time.sleep(0.002)
-            continue
-        
-        if effect:
-            effect.update(_last_music_color, audio, _current_album_url)
-        
-        last_update = now
-        time.sleep(min_interval)
-
-
-# ══════════════════════════════════════════════════════════
-# MAIN LOOP (OTIMIZADO)
-# ══════════════════════════════════════════════════════════
-
-def main_loop():
-    """Loop principal."""
-    global _running, _current_color, _last_music_color
-
-    if _debug_mode:
-        logger.info("=" * 50)
-        logger.info("  🎵 Spotify RGB Sync (Optimized)")
-        logger.info("=" * 50)
-
-    # ── Spotify ──
-    sp = None
-    for i in range(3):  # Menos tentativas
-        try:
-            sp = create_spotify_client()
-            break
-        except Exception as e:
-            if _debug_mode:
-                logger.warning(f"Spotify {i+1}/3: {e}")
-            _smart_sleep(5)
-    
-    if not sp:
-        logger.error("Spotify falhou")
-        return
-
-    # ── OpenRGB ──
-    rgb = OpenRGBController()
-    rgb_ok = rgb.connect(retries=3, delay=3.0)
-
-    if rgb_ok:
-        rgb.set_mode("direct")
-        rgb.set_all_leds(*adjust_brightness(_current_color, config.BRIGHTNESS_FLOOR))
-
-    # ── Audio ──
-    audio = None
-    if rgb_ok and config.REACTIVE_MODE:
-        audio = AudioReactive(hold_time=config.HIT_HOLD_TIME)
-        if audio.start():
-            if _debug_mode:
-                logger.info("✅ Audio reactive ON")
-        else:
-            audio = None
-
-    if audio:
-        # Spotify em thread separada
-        threading.Thread(
-            target=_spotify_thread, 
-            args=(sp, rgb, rgb_ok), 
-            daemon=True
-        ).start()
-
-        _reactive_loop(audio, rgb)
-    else:
-        _spotify_thread(sp, rgb, rgb_ok)
-
-    # ── Cleanup ──
-    if audio:
-        audio.stop()
-    if rgb_ok:
-        idle = adjust_brightness(_last_music_color, config.BRIGHTNESS_FLOOR)
-        rgb.set_all_leds(*idle)
-        time.sleep(0.1)
-        rgb.disconnect()
-
-
-# ══════════════════════════════════════════════════════════
-# STATUS CALLBACK (para tray)
-# ══════════════════════════════════════════════════════════
 
 def get_status() -> dict:
-    """Retorna status atual pra o tray."""
     return {
-        'track': _current_track_name,
-        'is_playing': _is_playing,
-        'color': _current_color,
+        'track': state.track_name,
+        'is_playing': state.is_playing,
+        'color': state.color,
     }
 
 
 def quit_app():
-    """Encerra o app."""
-    global _running
-    _running = False
+    state.running = False
 
 
 # ══════════════════════════════════════════════════════════
-# ENTRY POINTS
+# LED HELPERS (otimizado)
 # ══════════════════════════════════════════════════════════
 
-def run_headless():
-    """Roda sem interface (mais leve)."""
-    main_loop()
+def get_led_config(rgb) -> Tuple[int, List[Dict]]:
+    devices = rgb.get_active_devices()
+    total = sum(d["leds"] for d in devices)
+    skip_s = getattr(config, 'LED_SKIP_START', 0)
+    skip_e = getattr(config, 'LED_SKIP_END', 0)
+    usable = total - skip_s - skip_e
+    configured = getattr(config, 'LED_COUNT', None)
+    return (configured if configured and configured > 0 else usable), devices
 
 
-def run_with_tray():
-    """Roda com tray icon minimalista."""
-    from tray_minimal import MinimalTray
+def map_colors(colors: List[RGB], count: int, devices: List[Dict]) -> List[List[RGB]]:
+    """Mapeia cores virtuais pra LEDs reais (versão otimizada)."""
+    total = sum(d["leds"] for d in devices)
+    skip_s = getattr(config, 'LED_SKIP_START', 0)
+    skip_e = getattr(config, 'LED_SKIP_END', 0)
     
-    # Inicia o core em thread
-    core_thread = threading.Thread(target=main_loop, daemon=True)
-    core_thread.start()
+    full = [(0, 0, 0)] * total
+    usable = total - skip_s - skip_e
     
-    # Cria tray
-    tray = MinimalTray(
-        on_quit_callback=quit_app,
-        get_status_callback=get_status
-    )
+    if usable <= 0 or not colors:
+        return [[full[0]] * d["leds"] for d in devices]
     
-    # Roda tray (bloqueia)
-    tray.run()
+    n_colors = len(colors)
+    for i in range(usable):
+        pos = (i / max(1, usable - 1)) * max(1, n_colors - 1) if n_colors > 1 else 0
+        idx = int(pos)
+        frac = pos - idx
+        c1 = colors[min(idx, n_colors - 1)]
+        c2 = colors[min(idx + 1, n_colors - 1)]
+        
+        full[skip_s + i] = (
+            int(c1[0] + (c2[0] - c1[0]) * frac),
+            int(c1[1] + (c2[1] - c1[1]) * frac),
+            int(c1[2] + (c2[2] - c1[2]) * frac),
+        )
+    
+    result = []
+    offset = 0
+    for d in devices:
+        n = d["leds"]
+        result.append(full[offset:offset + n])
+        offset += n
+    return result
 
+
+# ══════════════════════════════════════════════════════════
+# ENGINE
+# ══════════════════════════════════════════════════════════
+
+def run_engine():
+    """Engine principal (roda em thread)."""
+    # Lazy imports
+    from spotify_module import create_spotify_client, get_current_track
+    from color_module import get_dominant_color, adjust_brightness, clear_cache
+    from openrgb_module import OpenRGBController
+    
+    if _debug:
+        logger.info("🎵 Engine iniciando...")
+    
+    # Spotify
+    sp = None
+    for i in range(3):
+        try:
+            sp = create_spotify_client()
+            break
+        except Exception as e:
+            if _debug:
+                logger.warning(f"Spotify {i+1}/3: {e}")
+            smart_sleep(3)
+    
+    if not sp:
+        logger.error("Spotify falhou")
+        return
+    
+    # OpenRGB
+    rgb = OpenRGBController()
+    rgb_ok = rgb.connect(retries=2, delay=2.0)
+    
+    if not rgb_ok:
+        logger.warning("OpenRGB não conectado")
+    
+    # Audio
+    audio = None
+    effect = None
+    standby_effect = None
+    
+    if rgb_ok and config.REACTIVE_MODE:
+        from audio_spotify_only import AudioReactiveSpotifyOnly
+        audio = AudioReactiveSpotifyOnly(hold_time=config.HIT_HOLD_TIME)
+        if audio.start():
+            if _debug:
+                logger.info("✅ Audio ON")
+            
+            # Cria efeitos
+            from band_module import BandVisualizer
+            
+            led_count, devices = get_led_config(rgb)
+            viz = BandVisualizer(led_count)
+            
+            class Effect:
+                __slots__ = ('viz', 'devices', 'led_count', 'last_color', 'last_url', 'colors')
+                def __init__(self):
+                    self.viz = viz
+                    self.devices = devices
+                    self.led_count = led_count
+                    self.last_color = None
+                    self.last_url = None
+                    self.colors = {}
+            
+            effect = Effect()
+            
+            # Standby
+            class Standby:
+                __slots__ = ('phase', 'devices', 'led_count')
+                def __init__(self):
+                    self.phase = 0.0
+                    self.devices = devices
+                    self.led_count = led_count
+            
+            standby_effect = Standby()
+        else:
+            audio = None
+    
+    if rgb_ok:
+        rgb.set_mode("direct")
+    
+    # Monitor bridge
+    try:
+        from monitor_bridge import monitor
+        has_monitor = True
+    except ImportError:
+        has_monitor = False
+        monitor = None
+    
+    # ═══════════════════════════════════════════════════
+    # LOOP PRINCIPAL
+    # ═══════════════════════════════════════════════════
+    
+    last_poll = 0
+    last_frame = 0
+    fps = getattr(config, 'MAX_FPS', 60)
+    fps_standby = getattr(config, 'STANDBY_FPS', 15)
+    
+    while state.running:
+        now = time.monotonic()
+        
+        # ── Polling Spotify ──
+        if now - last_poll > (config.POLL_IDLE if state.standby else config.POLL_INTERVAL):
+            last_poll = now
+            
+            try:
+                track = get_current_track(sp)
+                
+                if track is None or not track.is_playing:
+                    state.standby = True
+                    state.is_playing = False
+                else:
+                    state.standby = False
+                    state.is_playing = True
+                    
+                    if track.track_id != state.track_id:
+                        state.track_id = track.track_id
+                        state.track_name = f"{track.artist} - {track.name}"
+                        state.album_url = track.album_art
+                        
+                        clear_cache()
+                        state.color = get_dominant_color(track.album_art)
+                        state.last_color = state.color
+                        
+                        if has_monitor:
+                            monitor.update(track=state.track_name, is_playing=True)
+                        
+                        if _debug:
+                            logger.info(f"🎵 {state.track_name}")
+            except Exception as e:
+                if _debug:
+                    logger.error(f"Poll: {e}")
+        
+        # ── FPS Control ──
+        target_fps = fps_standby if state.standby else fps
+        frame_time = 1.0 / target_fps
+        
+        if now - last_frame < frame_time:
+            time.sleep(0.001)
+            continue
+        
+        last_frame = now
+        
+        # ── Render ──
+        if not rgb_ok:
+            continue
+        
+        if state.standby:
+            # Breathing
+            if standby_effect:
+                import math
+                speed = getattr(config, 'STANDBY_BREATHING_SPEED', 0.025)
+                min_b = getattr(config, 'STANDBY_BRIGHTNESS_MIN', 0.15)
+                max_b = getattr(config, 'STANDBY_BRIGHTNESS_MAX', 0.40)
+                
+                standby_effect.phase += speed
+                if standby_effect.phase > 6.283:
+                    standby_effect.phase -= 6.283
+                
+                wave = (math.sin(standby_effect.phase) + 1) / 2
+                b = min_b + wave * (max_b - min_b)
+                
+                c = state.last_color
+                color = (min(255, int(c[0] * b)), min(255, int(c[1] * b)), min(255, int(c[2] * b)))
+                
+                colors = [color] * standby_effect.led_count
+                mapped = map_colors(colors, standby_effect.led_count, standby_effect.devices)
+                
+                for dev, cols in zip(standby_effect.devices, mapped):
+                    rgb.set_device_leds(dev["index"], cols)
+                
+                if has_monitor:
+                    flat = [c for cols in mapped for c in cols]
+                    monitor.update(is_playing=False, led_colors=flat, bass=0, melody=0, percussion=0)
+        
+        elif effect and audio:
+            # Atualiza cores se mudou
+            if state.color != effect.last_color or state.album_url != effect.last_url:
+                cols = effect.viz.set_base_color(state.color, state.album_url)
+                effect.last_color = state.color
+                effect.last_url = state.album_url
+                if cols and len(cols) >= 3:
+                    effect.colors = {'percussion': cols[0], 'bass': cols[1], 'melody': cols[2]}
+            
+            # Gera frame
+            virtual = effect.viz.generate(
+                bass=audio.bass,
+                melody=audio.melody,
+                percussion=audio.percussion,
+                beat_intensity=audio.beat_intensity,
+                volume=audio.volume_normalized,
+                state=audio.state,
+            )
+            
+            mapped = map_colors(virtual, effect.led_count, effect.devices)
+            
+            for dev, cols in zip(effect.devices, mapped):
+                rgb.set_device_leds(dev["index"], cols)
+            
+            if has_monitor:
+                flat = [c for cols in mapped for c in cols]
+                monitor.update(
+                    percussion=audio.percussion,
+                    bass=audio.bass,
+                    melody=audio.melody,
+                    color_percussion=effect.colors.get('percussion', (255, 100, 100)),
+                    color_bass=effect.colors.get('bass', (100, 100, 255)),
+                    color_melody=effect.colors.get('melody', (100, 255, 100)),
+                    led_colors=flat,
+                    volume=audio.volume_normalized,
+                    beat_intensity=audio.beat_intensity,
+                    state=audio.state,
+                    agc_gain=getattr(audio, 'agc_gain', 1.0),
+                    is_playing=True,
+                )
+    
+    # Cleanup
+    if audio:
+        audio.stop()
+    if rgb_ok:
+        c = adjust_brightness(state.last_color, config.BRIGHTNESS_FLOOR)
+        rgb.set_all_leds(*c)
+        rgb.disconnect()
+
+
+# ══════════════════════════════════════════════════════════
+# MAIN
+# ══════════════════════════════════════════════════════════
 
 def main():
-    """Entry point principal."""
     import argparse
-    parser = argparse.ArgumentParser(description="Spotify RGB Sync")
-    parser.add_argument("--debug", action="store_true", help="Modo debug (verbose)")
-    parser.add_argument("--headless", action="store_true", help="Sem tray (terminal)")
-    parser.add_argument("--gui", action="store_true", help="Abre GUI direto")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--debug", action="store_true")
+    parser.add_argument("--headless", action="store_true")
     args = parser.parse_args()
     
-    global _debug_mode
-    _debug_mode = args.debug
+    global _debug
+    _debug = args.debug
     
     if args.headless:
-        run_headless()
-    elif args.gui:
-        # Abre GUI direto (pra debug)
-        run_with_tray()
-    else:
-        # Padrão: tray minimalista
-        run_with_tray()
+        run_engine()
+        return
+    
+    # ═══════════════════════════════════════════════════
+    # GUI + TRAY (Qt)
+    # ═══════════════════════════════════════════════════
+    
+    from PyQt6.QtWidgets import QApplication, QSystemTrayIcon, QMenu, QMessageBox
+    from PyQt6.QtGui import QIcon, QPixmap, QPainter, QColor, QPen
+    from PyQt6.QtCore import Qt, QTimer
+    
+    app = QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(False)
+    app.setApplicationName("Spotify RGB Sync")
+    
+    gui_window = None
+    
+    # ── Ícone ──
+    def make_icon():
+        px = QPixmap(48, 48)
+        px.fill(Qt.GlobalColor.transparent)
+        p = QPainter(px)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        c = state.color or (100, 0, 200)
+        p.setBrush(QColor(*c))
+        p.setPen(QPen(QColor(0, 0, 0), 2))
+        p.drawRoundedRect(2, 2, 44, 44, 6, 6)
+        p.setBrush(QColor(0, 255, 0) if state.is_playing else QColor(80, 80, 80))
+        p.drawEllipse(32, 32, 12, 12)
+        p.end()
+        return QIcon(px)
+    
+    # ── Menu ──
+    def open_gui():
+        nonlocal gui_window
+        try:
+            from gui.main_window import MainWindow
+            if gui_window is None:
+                gui_window = MainWindow(app_ref=None)
+            gui_window.show()
+            gui_window.raise_()
+            gui_window.activateWindow()
+        except Exception as e:
+            QMessageBox.critical(None, "Erro", f"Falha ao abrir GUI:\n\n{e}")
+    
+    def show_log():
+        import subprocess
+        log = APP_DIR / "spotify_rgb.log"
+        if log.exists():
+            subprocess.Popen(["notepad.exe", str(log)])
+    
+    def do_quit():
+        quit_app()
+        app.quit()
+    
+    tray = QSystemTrayIcon()
+    tray.setIcon(make_icon())
+    tray.setToolTip("Spotify RGB Sync")
+    
+    menu = QMenu()
+    menu.addAction("🎵 Spotify RGB Sync").setEnabled(False)
+    menu.addSeparator()
+    
+    status_act = menu.addAction("⏸ Pausado")
+    status_act.setEnabled(False)
+    
+    track_act = menu.addAction("♪ ---")
+    track_act.setEnabled(False)
+    
+    menu.addSeparator()
+    menu.addAction("⚙️ Configurações", open_gui)
+    menu.addAction("📄 Ver Log", show_log)
+    menu.addSeparator()
+    menu.addAction("❌ Sair", do_quit)
+    
+    tray.setContextMenu(menu)
+    tray.show()
+    
+    # ── Update Timer ──
+    def update():
+        tray.setIcon(make_icon())
+        status_act.setText("▶ Tocando" if state.is_playing else "⏸ Pausado")
+        t = state.track_name or "---"
+        track_act.setText(f"♪ {t[:35]}..." if len(t) > 35 else f"♪ {t}")
+    
+    timer = QTimer()
+    timer.timeout.connect(update)
+    timer.start(2000)
+    
+    # ── Engine Thread ──
+    threading.Thread(target=run_engine, daemon=True).start()
+    
+    if _debug:
+        logger.info("✅ App rodando")
+    
+    sys.exit(app.exec())
 
 
 if __name__ == "__main__":

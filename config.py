@@ -1,32 +1,54 @@
-# config.py
-"""
-Configuração do Spotify RGB Sync
-Auto-gerado pela GUI
-"""
-
 import os
 from pathlib import Path
 
-ENV_PATH = Path(__file__).parent / ".env"
+# ══════════════════════════════════════════════════════════════════════════════
+# CARREGAMENTO DO .env COM FALLBACK
+# ══════════════════════════════════════════════════════════════════════════════
 
 def load_env():
-    if ENV_PATH.exists():
-        with open(ENV_PATH) as f:
+    """Carrega .env do diretório do executável ou script."""
+    # Detecta se está rodando como executável PyInstaller
+    if getattr(sys, 'frozen', False):
+        # Executável: usa diretório do .exe
+        app_dir = Path(sys.executable).parent
+    else:
+        # Script: usa diretório do config.py
+        app_dir = Path(__file__).parent
+    
+    env_path = app_dir / ".env"
+    
+    if env_path.exists():
+        with open(env_path, encoding='utf-8') as f:
             for line in f:
                 line = line.strip()
                 if line and not line.startswith("#") and "=" in line:
                     key, value = line.split("=", 1)
                     os.environ.setdefault(key.strip(), value.strip())
+        return True
+    return False
 
-load_env()
+import sys
+_env_loaded = load_env()
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SPOTIFY API
+# SPOTIFY API (com defaults vazios se .env não existir)
 # ══════════════════════════════════════════════════════════════════════════════
 
-SPOTIFY_CLIENT_ID     = os.environ["SPOTIPY_CLIENT_ID"]
-SPOTIFY_CLIENT_SECRET = os.environ["SPOTIPY_CLIENT_SECRET"]
-SPOTIFY_REDIRECT_URI  = os.environ["SPOTIPY_REDIRECT_URI"]
+SPOTIFY_CLIENT_ID = os.environ.get("SPOTIPY_CLIENT_ID", "")
+SPOTIFY_CLIENT_SECRET = os.environ.get("SPOTIPY_CLIENT_SECRET", "")
+SPOTIFY_REDIRECT_URI = os.environ.get("SPOTIPY_REDIRECT_URI", "http://localhost:8888/callback")
+
+# Validação (só em modo debug)
+if __name__ != "__main__" and not _env_loaded:
+    import logging
+    logger = logging.getLogger(__name__)
+    logger.warning(
+        "⚠️  Arquivo .env não encontrado!\n"
+        "   Crie um arquivo .env na pasta do executável com:\n"
+        "   SPOTIPY_CLIENT_ID=seu_id\n"
+        "   SPOTIPY_CLIENT_SECRET=seu_secret\n"
+        "   SPOTIPY_REDIRECT_URI=http://localhost:8888/callback"
+    )
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SPOTIFY POLLING RATE
@@ -106,7 +128,7 @@ HIT_HOLD_TIME = 0.18
 # CHASE EFFECT
 # ══════════════════════════════════════════════════════════════════════════════
 
-CHASE_ENABLED = True
+CHASE_ENABLED = False
 CHASE_SPEED_MAX = 0.8
 CHASE_TAIL_LENGTH = 4
 CHASE_BRIGHTNESS_MIN = 0.1
@@ -162,9 +184,9 @@ BAND_BG_BRIGHTNESS = 0.08
 BAND_INTERNAL_GRADIENT = 0.03
 BAND_COLOR_LERP = 0.4
 BAND_ZONE_BLEND_WIDTH = 2
-BAND_BOOST_PERCUSSION = 1.4
-BAND_BOOST_BASS = 1.2
-BAND_BOOST_MELODY = 1.7
+BAND_BOOST_PERCUSSION = 1.1
+BAND_BOOST_BASS = 0.9
+BAND_BOOST_MELODY = 1.5
 BAND_EXPANSION_PERCUSSION = 1.2000000000000002
 BAND_EXPANSION_BASS = 1.0
 BAND_EXPANSION_MELODY = 1.4
@@ -177,7 +199,7 @@ BAND_CEILING_MELODY = 1.3
 BAND_ATTACK = 0.45
 BAND_DECAY = 0.08
 BAND_RESPONSE_CURVE = 'linear'
-BAND_COMPRESSION_ENABLED = True
+BAND_COMPRESSION_ENABLED = False
 BAND_COMPRESSION_THRESHOLD = 0.7
 BAND_COMPRESSION_RATIO = 1.0
 
@@ -187,7 +209,7 @@ BAND_COMPRESSION_RATIO = 1.0
 
 STANDBY_BRIGHTNESS_MIN = 0.15
 STANDBY_BRIGHTNESS_MAX = 0.4
-STANDBY_BREATHING_SPEED = 0.025
+STANDBY_BREATHING_SPEED = 0.08
 
 # ══════════════════════════════════════════════════════════════════════════════
 # QUANTIZED
@@ -200,6 +222,13 @@ QUANTIZED_LEVELS = 5
 # OUTROS
 # ══════════════════════════════════════════════════════════════════════════════
 
+ADAPTIVE_SMOOTHING = True
+AGC_ATTACK = 0.03
+AGC_ENABLED = False
+AGC_MAX_GAIN = 3.5
+AGC_MIN_GAIN = 0.8
+AGC_RELEASE = 0.01
+AGC_TARGET = 0.35
 BAND_FREQ_BASS_MAX = 400
 BAND_FREQ_BASS_MIN = 200
 BAND_FREQ_MELODY_MAX = 16000
@@ -209,65 +238,21 @@ BAND_FREQ_PERCUSSION_MIN = 20
 COLOR_ASSIGNMENT_MODE = 'vibrant_bass'
 COLOR_MIN_SATURATION = 0.8
 COLOR_SELECTION_STRATEGY = 'contrast'
-
-# ══════════════════════════════════════════════════════════════════════════════
-# AGC (Automatic Gain Control) — Normalização adaptativa
-# ══════════════════════════════════════════════════════════════════════════════
-
-# Habilita AGC (normalização adaptativa ao volume)
-AGC_ENABLED = True
-
-# Ganho máximo quando volume está baixo (1.0 = sem boost, 4.0 = 4x)
-AGC_MAX_GAIN = 3.5
-
-# Ganho mínimo quando volume está alto (evita saturar)
-AGC_MIN_GAIN = 0.8
-
-# Velocidade de adaptação do ganho (0.01 = lento, 0.1 = rápido)
-AGC_ATTACK = 0.03
-AGC_RELEASE = 0.01
-
-# Volume alvo (o AGC tenta manter a energia média nesse nível)
-AGC_TARGET = 0.35
-
-# ══════════════════════════════════════════════════════════════════════════════
-# COMPRESSOR DE DINÂMICA — Suaviza diferença entre baixo/alto
-# ══════════════════════════════════════════════════════════════════════════════
-
-# Threshold do compressor (0.0-1.0, valores abaixo não são comprimidos)
-COMPRESSOR_THRESHOLD = 0.25
-
-# Ratio (2.0 = 2:1, 4.0 = 4:1, quanto maior mais comprime)
-COMPRESSOR_RATIO = 2.5
-
-# Knee (suavidade da transição, 0.0 = hard knee, 0.3 = soft)
 COMPRESSOR_KNEE = 0.15
-
-# Makeup gain automático (compensa a redução de volume)
 COMPRESSOR_MAKEUP = 1.4
-
-# ══════════════════════════════════════════════════════════════════════════════
-# SMOOTHING ADAPTATIVO — Decay mais lento em volume baixo
-# ══════════════════════════════════════════════════════════════════════════════
-
-# Habilita smoothing adaptativo
-ADAPTIVE_SMOOTHING = True
-
-# Multiplicador de decay em volume baixo (2.0 = decay 2x mais lento)
+COMPRESSOR_RATIO = 2.5
+COMPRESSOR_THRESHOLD = 0.25
+DYNAMIC_FLOOR_ENABLED = True
+DYNAMIC_FLOOR_MAX = 0.15
+DYNAMIC_FLOOR_THRESH = 0.3
 SMOOTHING_LOW_VOL_MULT = 2.5
-
-# Limiar de "volume baixo" (0.0-1.0)
 SMOOTHING_LOW_VOL_THRESH = 0.35
 
+
 # ══════════════════════════════════════════════════════════════════════════════
-# FLOOR DINÂMICO — Brilho mínimo sobe quando volume está baixo
+# PERFORMANCE
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Habilita floor dinâmico
-DYNAMIC_FLOOR_ENABLED = True
-
-# Floor máximo quando volume está muito baixo
-DYNAMIC_FLOOR_MAX = 0.15
-
-# Volume abaixo do qual o floor começa a subir
-DYNAMIC_FLOOR_THRESH = 0.30
+MAX_FPS = 60           # FPS máximo quando tocando
+STANDBY_FPS = 15       # FPS quando pausado
+START_MINIMIZED = True # Inicia só no tray

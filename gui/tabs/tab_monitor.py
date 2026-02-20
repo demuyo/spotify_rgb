@@ -32,8 +32,9 @@ class BandMeter(QWidget):
 
     def set_color(self, color: tuple):
         """Atualiza cor RGB."""
-        self._color = color
-        self.update()
+        if color and len(color) >= 3:
+            self._color = color
+            self.update()
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -53,10 +54,10 @@ class BandMeter(QWidget):
         fill_h = int(bar_h * self._value)
         r, g, b = self._color
         
-        # Aplica gamma pra visualização (sem isso, cores escuras ficam invisíveis)
-        display_r = min(255, int(r ** 0.7))
-        display_g = min(255, int(g ** 0.7))
-        display_b = min(255, int(b ** 0.7))
+        # Aplica gamma pra visualização
+        display_r = min(255, int((r / 255) ** 0.7 * 255))
+        display_g = min(255, int((g / 255) ** 0.7 * 255))
+        display_b = min(255, int((b / 255) ** 0.7 * 255))
         
         painter.fillRect(
             bar_x, bar_y + bar_h - fill_h,
@@ -78,7 +79,7 @@ class BandMeter(QWidget):
         painter.setFont(font)
         painter.drawText(0, h - 20, w, 20, Qt.AlignmentFlag.AlignCenter, self._label)
 
-        # Valor numérico (com a cor da banda)
+        # Valor numérico
         painter.setPen(QPen(QColor(display_r, display_g, display_b), 1))
         font.setPointSize(8)
         painter.setFont(font)
@@ -91,46 +92,36 @@ class BandMeter(QWidget):
 
 
 class LEDStripPreview(QWidget):
-    """Preview da fita de LED com auto-scaling e gamma correction."""
+    """Preview da fita de LED com gamma correction."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setFixedHeight(40)
         self._colors = []
-        self._brightness_floor = 15  # RGB mínimo (nenhum LED preto puro)
-        self._gamma = 0.6  # Gamma correction (< 1.0 clareia)
+        self._brightness_floor = 15
+        self._gamma = 0.6
 
     def set_colors(self, colors: list):
         """Atualiza cores dos LEDs."""
-        self._colors = colors
+        self._colors = colors if colors else []
         self.update()
 
     def _enhance_color(self, r: int, g: int, b: int) -> tuple:
-        """
-        Aplica melhorias visuais pra preview:
-        1. Gamma correction → clareia cores escuras
-        2. Brightness floor → nenhum LED fica preto puro
-        3. Preserva o hue original
-        """
-        # Normaliza (0-1)
+        """Aplica melhorias visuais."""
         r_norm = r / 255.0
         g_norm = g / 255.0
         b_norm = b / 255.0
 
-        # Aplica gamma (valores baixos ficam mais claros)
         r_gamma = r_norm ** self._gamma
         g_gamma = g_norm ** self._gamma
         b_gamma = b_norm ** self._gamma
 
-        # Volta pra 0-255
         r_out = int(r_gamma * 255)
         g_out = int(g_gamma * 255)
         b_out = int(b_gamma * 255)
 
-        # Brightness floor (LEDs muito escuros ficam no mínimo visível)
         max_component = max(r_out, g_out, b_out)
         if max_component < self._brightness_floor and max_component > 0:
-            # Escala proporcionalmente até o floor
             scale = self._brightness_floor / max_component
             r_out = min(255, int(r_out * scale))
             g_out = min(255, int(g_out * scale))
@@ -144,8 +135,6 @@ class LEDStripPreview(QWidget):
             return
 
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)  # Faster
-
         w = self.width()
         h = self.height()
         n = len(self._colors)
@@ -154,34 +143,16 @@ class LEDStripPreview(QWidget):
             painter.end()
             return
 
-        # Largura de cada LED
         led_w = w / n
 
-        # ══════════════════════════════════════════════════
-        # AUTO-SCALING (opcional, ativa se tudo tá muito escuro)
-        # ══════════════════════════════════════════════════
-        max_brightness = max(max(r, g, b) for r, g, b in self._colors)
-        
-        # Se o LED mais brilhante é < 60, aplica boost global
-        boost = 1.0
-        if max_brightness > 0 and max_brightness < 60:
-            boost = min(3.0, 60.0 / max_brightness)
-
-        # ══════════════════════════════════════════════════
-        # RENDERIZA
-        # ══════════════════════════════════════════════════
-        for i, (r, g, b) in enumerate(self._colors):
-            # Boost se necessário
-            r = min(255, int(r * boost))
-            g = min(255, int(g * boost))
-            b = min(255, int(b * boost))
-
-            # Aplica melhorias visuais
+        for i, color in enumerate(self._colors):
+            if not color or len(color) < 3:
+                continue
+            r, g, b = color[0], color[1], color[2]
             r_display, g_display, b_display = self._enhance_color(r, g, b)
 
-            # Desenha
             x = int(i * led_w)
-            w_rect = int(led_w) + 1  # +1 pra não deixar gap
+            w_rect = int(led_w) + 1
             painter.fillRect(
                 x, 0, w_rect, h,
                 QBrush(QColor(r_display, g_display, b_display))
@@ -196,6 +167,14 @@ class TabMonitor(QWidget):
     def __init__(self, app_ref=None, parent=None):
         super().__init__(parent)
         self.app_ref = app_ref
+        
+        # Tenta importar o bridge
+        self._bridge = None
+        try:
+            from monitor_bridge import monitor
+            self._bridge = monitor
+        except ImportError:
+            pass
 
         layout = QVBoxLayout(self)
         layout.setSpacing(12)
@@ -249,7 +228,7 @@ class TabMonitor(QWidget):
         self._timer.timeout.connect(self._update)
         self._timer.start(50)  # 20fps
 
-        # Tracking pra FPS
+        # FPS tracking
         self._last_update_count = 0
         self._fps_timer = QTimer()
         self._fps_timer.timeout.connect(self._calc_fps)
@@ -262,22 +241,39 @@ class TabMonitor(QWidget):
         self._current_fps = self._update_count - self._last_update_count
         self._last_update_count = self._update_count
 
+    def _get_data(self) -> dict:
+        """
+        Pega dados do monitor.
+        Tenta: bridge > app_ref.get_monitor_data() > None
+        """
+        # Tenta bridge primeiro (mais confiável)
+        if self._bridge:
+            try:
+                return self._bridge.get_data()
+            except Exception:
+                pass
+        
+        # Fallback: app_ref
+        if self.app_ref and hasattr(self.app_ref, 'get_monitor_data'):
+            try:
+                return self.app_ref.get_monitor_data()
+            except Exception:
+                pass
+        
+        return None
+
     def _update(self):
         """Atualiza visualização."""
-        if not self.app_ref:
-            return
-
         self._update_count += 1
 
         try:
-            if not hasattr(self.app_ref, 'get_monitor_data'):
-                self._info_label.setText("❌ app_ref.get_monitor_data() não existe")
-                return
-
-            data = self.app_ref.get_monitor_data()
+            data = self._get_data()
 
             if not data:
-                self._info_label.setText("⚠ get_monitor_data() retornou None")
+                self._info_label.setText(
+                    "⚠ Sem dados do engine\n"
+                    "Verifique se o main.py está rodando"
+                )
                 return
 
             # ── Band levels ──
@@ -288,11 +284,11 @@ class TabMonitor(QWidget):
 
             # ── Band colors ──
             colors = data.get('band_colors', {})
-            if 'percussion' in colors:
+            if colors.get('percussion'):
                 self.meter_perc.set_color(colors['percussion'])
-            if 'bass' in colors:
+            if colors.get('bass'):
                 self.meter_bass.set_color(colors['bass'])
-            if 'melody' in colors:
+            if colors.get('melody'):
                 self.meter_melody.set_color(colors['melody'])
 
             # ── LED colors ──
@@ -307,7 +303,7 @@ class TabMonitor(QWidget):
             if 'fps' in data:
                 info_parts.append(f"Engine FPS: {data['fps']:.0f}")
             
-            if 'track' in data:
+            if 'track' in data and data['track']:
                 track = data['track']
                 if len(track) > 50:
                     track = track[:47] + "..."
@@ -319,22 +315,28 @@ class TabMonitor(QWidget):
             
             if 'led_count' in data:
                 info_parts.append(f"LEDs: {data['led_count']}")
+            
+            if 'agc_gain' in data:
+                info_parts.append(f"AGC Gain: {data['agc_gain']:.2f}x")
 
             # Mostra valores das bandas
             if bands:
                 band_str = (
-                    f"🥁{bands.get('percussion', 0.0):.2f}  "
-                    f"🎸{bands.get('bass', 0.0):.2f}  "
-                    f"🎹{bands.get('melody', 0.0):.2f}"
+                    f"🥁 {bands.get('percussion', 0.0):.2f}  "
+                    f"🎸 {bands.get('bass', 0.0):.2f}  "
+                    f"🎹 {bands.get('melody', 0.0):.2f}"
                 )
                 info_parts.append(band_str)
+            
+            if 'state' in data and data['state'] != 'idle':
+                info_parts.append(f"🎯 {data['state'].upper()}")
 
             self._info_label.setText("\n".join(info_parts))
 
         except Exception as e:
             import traceback
             self._info_label.setText(
-                f"❌ Erro no monitor:\n{e}\n\n{traceback.format_exc()}"
+                f"❌ Erro:\n{e}\n\n{traceback.format_exc()}"
             )
 
     def reload_values(self):
