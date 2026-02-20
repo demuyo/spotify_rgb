@@ -39,6 +39,9 @@ logger = logging.getLogger("SpotifyRGB")
 # IMPORTS (só o necessário)
 # ══════════════════════════════════════════════════════════
 
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'modules'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
+
 import config
 from spotify_module import create_spotify_client, get_current_track
 from color_module import get_dominant_color, adjust_brightness, clear_cache

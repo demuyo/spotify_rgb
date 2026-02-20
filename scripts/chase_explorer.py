@@ -9,6 +9,11 @@ import logging
 
 from openrgb import OpenRGBClient
 from openrgb.utils import RGBColor, DeviceType
+
+import sys
+import os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'modules'))
+
 import config
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
