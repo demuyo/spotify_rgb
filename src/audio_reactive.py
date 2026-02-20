@@ -13,6 +13,10 @@ from typing import Optional
 
 import numpy as np
 
+import sys
+import os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'modules'))
+
 import config
 
 logger = logging.getLogger(__name__)

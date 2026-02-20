@@ -42,6 +42,9 @@ logger = logging.getLogger("SpotifyRGB")
 # IMPORTS ESSENCIAIS (lazy imports pra GUI depois)
 # ══════════════════════════════════════════════════════════
 
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'modules'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
+
 import config
 
 # ══════════════════════════════════════════════════════════
